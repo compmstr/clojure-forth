@@ -1,81 +1,114 @@
 (ns forth.forth
   (use clojure.repl))
 
-(def stack (atom ()))
-(def ret-stack (atom ()))
-(def forth-mode (atom :interp))
-(def forth-input (atom ""))
 ;;Dictonary entries have the following keys:
 ;;  :fn or :subwords if primitive or not
 ;;  :primitive?
 ;;  :immediate?
 ;;  :name
-(def dict (atom ()))
+(defn new-vm
+  []
+  {:ip nil        ;;Instruction pointer
+   :stack ()      ;;Data stack
+   :ret-stack ()  ;;Return stack
+   :mode :interp  ;;Current mode (interp or compile)
+   :input ""      ;;Input buffer
+   :dict ()       ;;Dictionary
+   })
+
+(defn forth-read
+  ([vm]
+     (forth-read (read-line)))
+  ([vm text]
+     (assoc vm :input text)))
+
+(defn forth-read-until
+  "Returns [<word read> <new vm state>]"
+  ([vm re]
+     (loop [input (.trim (:input vm))
+            word []]
+       (if (or (empty? input)
+               (re-find re (apply str input)))
+         [(apply str word)
+          (assoc vm :input (apply str input))]
+         (recur (rest input)
+                (conj word (first input))))))
+  ([vm]
+     (forth-read-until vm #"^\s")))
+(defn forth-next-word
+  [vm]
+  (forth-read-until vm))
+
 
 (defn do-pop
-  ([stack]
-     (do-pop stack true))
-  ([stack ignore-empty?]
-     (let [item (first @stack)]
-       (if ignore-empty?
-         (swap! stack pop)
-         (if (not (empty? @stack))
-           (swap! stack pop)))
-       item)))
+  "Return a vector of [<popped value> <new vm state>]"
+  ([stack vm]
+     (do-pop stack false vm))
+  ([stack check-empty? vm]
+     (let [item (first (vm stack))]
+       [item
+        (if (not check-empty?)
+          (update-in vm [stack] pop)
+          (if (not (empty? (vm stack)))
+            (update-in vm [stack] pop)
+            vm))])))
 
 (defn do-push
-  [stack item]
-  (swap! stack conj item))
+  [stack vm item]
+  (update-in vm [stack] conj item))
 
-(def push-stack (partial do-push stack))
-(def pop-stack (partial do-pop stack))
-(def push-ret-stack (partial do-push ret-stack))
-(def pop-ret-stack (partial do-pop ret-stack false))
-(def push-dict (partial do-push dict))
-(def pop-dict (partial do-pop dict))
+(def push-stack (partial do-push :stack))
+(def pop-stack (partial do-pop :stack))
+(def push-ret-stack (partial do-push :ret-stack))
+(def pop-ret-stack (partial do-pop :ret-stack true))
+(def push-dict (partial do-push :dict))
+(def pop-dict (partial do-pop :dict))
+(defn set-forth-mode [vm mode] (assoc vm :mode mode))
+(defn set-forth-ip [vm ip] (assoc vm :ip ip))
 
 (defn dict-find
-  [word]
-  (loop [cur @(first @dict)
-         dict (rest @dict)
-         from-bottom (count dict)]
-    (if (= (:name cur) word)
-      {:word cur :xt (bit-shift-left from-bottom 16)}
-      (if (empty? dict)
-        nil
-        (recur
-         @(first dict)
-         (rest dict)
-         (dec from-bottom))))))
+  [vm word]
+  (let [dict (vm :dict)]
+    (loop [cur (first dict)
+           dict (rest dict)
+           from-bottom (count dict)]
+      (if (= (:name cur) word)
+        {:word cur :xt (bit-shift-left from-bottom 16)}
+        (if (empty? dict)
+          nil
+          (recur
+           (first dict)
+           (rest dict)
+           (dec from-bottom)))))))
 
 (defn create
-  ([name]
-   (create name nil))
-  ([name {:keys [primitive? immediate? fn]}]
+  ([vm name]
+     (create vm name nil))
+  ([vm name {:keys [primitive? immediate? fn]}]
      (let [subwords (if primitive? nil {:subwords []})]
-       (push-dict (atom
-                   (merge
-                    {:name name
-                     :primitive? primitive?
-                     :immediate? immediate?}
-                    (if primitive?
-                      {:fn fn}
-                      {:subwords []})))))))
+       (push-dict vm
+                  (merge
+                   {:name name
+                    :primitive? primitive?
+                    :immediate? immediate?}
+                   (if primitive?
+                     {:fn fn}
+                     {:subwords []}))))))
 
 (defn create-prim
-  ([name f]
-     (create-prim name f false))
-  ([name f immediate?]
-     (create name {:primitive? true
-                   :immediate? immediate?
-                   :fn f})))
+  ([vm name f]
+     (create-prim vm name f false))
+  ([vm name f immediate?]
+     (create vm name {:primitive? true
+                      :immediate? immediate?
+                      :fn f})))
 
 ;;xts are as follows:
 ;;  lower 16 bits -> subword
 ;;  upper 47/48 bits -> index from bottom of dictionary stack
 (defn xt->dict-idx
-  [xt]
-  (let [dict-size (count @dict)
+  [vm xt]
+  (let [dict-size (count (vm :dict))
         from-bottom (bit-shift-right xt 16)]
     (if (< from-bottom dict-size)
       (- (dec dict-size) from-bottom)
@@ -85,174 +118,230 @@
   (bit-and xt 0xFFFF))
 
 (defn xt->info
-  [xt]
-  (let [dict-idx (xt->dict-idx xt)
+  [vm xt]
+  (let [dict-idx (xt->dict-idx vm xt)
         subword (xt->subword xt)]
     (if dict-idx
-      {:word @(nth @dict dict-idx)
+      {:word (nth (vm :dict) dict-idx)
        :subword subword}
       nil)))
 
 (defn xt-info->subword-xt
   [info]
-  (nth (:subwords (:word info))
-       (:subword info)))
+  (when (> (count (:subwords (:word info)))
+           (:subword info))
+    (nth (:subwords (:word info))
+         (:subword info))))
 
-(defn next-xt
-  "Returns the next xt, or nil if nothing left"
-  ([xt num]
-     (let [new-xt (+ xt num)
-           new-info (xt->info new-xt)]
-       (println (format "next-xt new-info: %s-%s ret-stack: %s"
-                        (:name (:word new-info))
-                        (:subword new-info)
-                        @ret-stack))
-       (if (<= (count (:subwords (:word new-info)))
-               (:subword new-info))
-         (pop-ret-stack)
-         new-xt)))
-  ([xt]
-     (next-xt xt 1)))
+(defn forth-next
+  ([vm num]
+     (if (and (:ip vm)
+                num)
+       (update-in vm [:ip]
+                  + num)
+       vm))
+  ([vm]
+     (forth-next vm 1)))
 
-(defmacro prim-fn
-  [& body]
-  `(fn [xt#]
-     ~@body
-     (next-xt xt#)))
-(create-prim "dup" (prim-fn (push-stack (first @stack))))
-(create-prim "+" (prim-fn
-                  (let [a (pop-stack)
-                        b (pop-stack)]
-                    (push-stack (+ a b)))))
-(create-prim "-"
-             (prim-fn
-              (let [a (pop-stack)
-                    b (pop-stack)]
-                (push-stack (- b a)))))
-(create-prim "."
-             (prim-fn
-              (println (pop-stack))))
-
-(declare forth-next-word)
-(create-prim "create"
-             (prim-fn
-              (create (forth-next-word))))
-
-(create-prim ":"
-             (prim-fn
-              (create (forth-next-word))
-              (reset! forth-mode :compile)))
-(create-prim ";"
-             (prim-fn
-              (reset! forth-mode :interp))
-             true)
-(create-prim "lit" (fn [xt]
-                     (let [info (xt->info (next-xt xt))]
-                       (println (format "in lit. info: %s -- num: %s" info
-                                        (xt-info->subword-xt info)))
-                       (push-stack (xt-info->subword-xt info))
-                       (println "Next xt: " (next-xt xt 1))
-                       (next-xt xt 1))))
-
-(defn forth-read
-  ([]
-     (forth-read (read-line)))
-  ([text]
-     (reset! forth-input text)))
-
-(defn forth-read-until
-  ([re]
-     (loop [input (.trim @forth-input)
-            word []]
-       (if (or (empty? input)
-               (re-find re (apply str input)))
-         (do
-           (reset! forth-input (apply str input))
-           (apply str word))
-         (recur (rest input)
-                (conj word (first input))))))
-  ([]
-     (forth-read-until #"^\s")))
-(defn forth-next-word
-  []
-  (forth-read-until))
-
-(declare do-xt)
-(defn run-xt
-  [xt]
-  (let [info (xt->info xt)]
-    (println (format "run-xt %s" (:name (:word info))))
-    (if (:primitive? (:word info))
-      ((:fn (:word info)) xt)
-      (do
-        (println (format "push-ret-stack: %s" (next-xt xt)))
-        (push-ret-stack (next-xt xt))
-        (xt-info->subword-xt info)))))
+(defn- add-subword
+  [entry val]
+  (update-in entry [:subwords]
+             conj val))
 (defn compile-val
-  [val]
-  (let [top-word (first @dict)]
-    (swap! top-word
-           (fn [cur]
-             (let [subwords (:subwords cur)
-                   new-subwords (conj subwords val)]
-               (assoc cur :subwords new-subwords))))))
-(defn compile-xt
-  [xt]
-  (compile-val xt)
-  (next-xt xt))
+  [vm val]
+  (update-in vm [:dict]
+             (fn [dict]
+               (conj (drop 1 dict)
+                     (add-subword (first dict) val)))))
 
-(defn- do-xt
-  [xt]
-  (when xt
-    (let [info (xt->info xt)]
-      (println (format "do-xt xt: %s name: %s subword: %s" xt (:name (:word info)) (:subword info)))
-      (when info
-        (case @forth-mode
-          :interp
-          (do 
-              (do-xt (run-xt xt)))
-          :compile
-          (do (println "Compiling word")
-              (do-xt (if (:immediate? (:word info))
-                       (run-xt xt)
-                       (compile-xt xt))))
-          (println "Error, invalid state"))))))
-(defn- handle-number
-  [num]
+(defn compile-word
+  [vm word]
+  (compile-val vm (:xt (dict-find vm word))))
+
+(defn handle-number
+  [vm num]
   (let [num (try
               (Integer/valueOf num)
               (catch Exception e
-                (throw (Exception. (format "Not found: %s" num)))))]
-    (case @forth-mode
+                (throw (Exception. (format "Word not found: %s" num)))))]
+    (case (:mode vm)
       :interp
-      (do (push-stack num))
+      (push-stack vm num)
       :compile
-      (do
-        (println "Compiling number: " num)
-        (compile-xt (:xt (dict-find "lit")))
-        (compile-val num))
-      (println "Error, invalid state"))))
-(defn forth-process-word
-  [word]
-  (let [entry (dict-find word)]
-    (println @stack)
-    (println (format "Word: %s -- xt: %s" word (:xt entry)))
+      (-> vm
+          (compile-word "lit")
+          (compile-val num)))))
+
+(defn valid-xt?
+  [vm xt]
+  (let [info (xt->info vm xt)]
+    (when info
+      (when (or (zero? (:subword info))
+                (< (:subword info)
+                   (count (:subwords (:word info)))))
+        true))))
+(defn push-ret-if-valid
+  [vm xt]
+  (if (valid-xt? vm xt)
+    (push-ret-stack vm xt)
+    vm))
+(defn run-xt
+  [vm xt]
+  (let [info (xt->info vm xt)]
+    (println (format "run-xt %s" (:name (:word info))))
+    (if (:primitive? (:word info))
+      ((:fn (:word info)) vm)
+      (-> vm
+          (push-ret-if-valid (inc xt))
+          (assoc :ip (xt-info->subword-xt info))))))
+
+(defn forth-step
+  [vm]
+  (if-let [ip (:ip vm)]
+    (case (:mode vm)
+      :interp
+      (run-xt vm ip)
+      :compile
+      (let [info (xt->info vm ip)]
+        (if (:immediate? (:word info))
+          (run-xt vm ip)
+          (compile-val vm ip))))
+    vm))
+
+(defn forth-exit
+  [vm]
+  (let [[new-xt vm] (pop-ret-stack vm)]
+    (println (format "forth-exit -- ret stack: %s" (:ret-stack vm)))
+    (assoc vm :ip new-xt)))
+
+(defn forth-process-read
+  [vm]
+  (let [[word vm] (forth-next-word vm)
+        entry (dict-find vm word)]
     (if entry
-      (do-xt (:xt entry))
-      (handle-number word))))
-(defn forth-eval
+      (case (:mode vm)
+        :interp
+        (assoc vm :ip (:xt entry))
+        :compile
+        (if (:immediate? (:word entry))
+          (assoc vm :ip (:xt entry))
+          (compile-val vm (:xt entry))))
+      (handle-number vm word))))
+
+(defn- has-input?
+  [vm]
+  (not (empty? (:input vm))))
+
+(def ^:dynamic *delay* #(Thread/sleep 100))
+(defn forth-exec-input
+  ([vm]
+     (forth-exec-input vm (read-line)))
+  ([vm input]
+     (loop [vm (forth-read vm input)]
+       (when *delay*
+        (*delay*))
+       (println (format "ip: %s -- input: %s -- mode: %s" (:ip vm) (:input vm) (:mode vm)))
+       (if (:ip vm)
+         (recur (forth-step vm))
+         (if (has-input? vm)
+           (recur (-> vm
+                      (forth-process-read)
+                      (forth-step)))
+           vm)))))
+
+(defmacro prim-fn
+  [& body]
+  `(fn [vm#]
+     (let [~'vm vm#]
+       (forth-exit
+        (do
+          ~@body)))))
+(defn add-prims
+  [vm]
+  (-> vm
+      (create-prim "dup" (prim-fn (push-stack vm (first (vm :stack)))))
+      (create-prim "over" (prim-fn (push-stack vm (second (vm :stack)))))
+      (create-prim "drop" (prim-fn (let [[_ vm] (pop-stack vm)]
+                                     vm)))
+      (create-prim "+" (prim-fn
+                        (let [[a vm] (pop-stack vm)
+                              [b vm] (pop-stack vm)]
+                          (push-stack vm (+ a b)))))
+      (create-prim "*" (prim-fn
+                        (let [[a vm] (pop-stack vm)
+                              [b vm] (pop-stack vm)]
+                          (push-stack vm (* a b)))))
+      (create-prim "-"
+                   (prim-fn
+                    (let [[a vm] (pop-stack vm)
+                          [b vm] (pop-stack vm)]
+                      (push-stack vm (- b a)))))
+      (create-prim "/"
+                   (prim-fn
+                    (let [[a vm] (pop-stack vm)
+                          [b vm] (pop-stack vm)]
+                      (push-stack vm (quot b a)))))
+      (create-prim "mod"
+                   (prim-fn
+                    (let [[a vm] (pop-stack vm)
+                          [b vm] (pop-stack vm)]
+                      (push-stack vm (mod b a)))))
+      (create-prim "."
+                   (prim-fn
+                    (let [[item vm] (pop-stack vm)]
+                      (println item)
+                      vm)))
+      (create-prim "emit"
+                   (prim-fn
+                    (let [[item vm] (pop-stack vm)]
+                      (print (char item))
+                      vm)))
+      (create-prim ".s"
+                   (prim-fn
+                    (println (:stack vm))
+                    vm))
+      (create-prim "create"
+                   (prim-fn
+                    (let [[cur-word vm] (forth-next-word vm)]
+                      (create vm cur-word))))
+      (create-prim ","
+                   (prim-fn
+                    (let [[item vm] (pop-stack vm)]
+                      (compile-val vm item))))
+      (create-prim ":"
+                   (prim-fn
+                    (let [[cur-word vm] (forth-next-word vm)]
+                      (-> vm
+                          (create cur-word)
+                          (set-forth-mode :compile)))))
+      (create-prim "exit" forth-exit)
+      (create-prim ";"
+                   (prim-fn
+                    (-> vm
+                        (compile-word "exit")
+                        (set-forth-mode :interp)))
+                   true)
+      (create-prim "lit" (fn [vm]
+                           (let [info (xt->info vm (inc (:ip vm)))]
+                             (-> vm
+                                 (push-stack (xt-info->subword-xt info))
+                                 (forth-next)))))
+))
+
+
+(defn test-vm
   []
-  (while (not (empty? @forth-input))
-    (forth-process-word (forth-next-word))))
+  (-> (new-vm)
+      (add-prims)
+      (push-stack 5)
+      (push-stack 4)))
 
-(defn forth-test
-  ([data]
-     (forth-read data)
-     (forth-eval))
-  ([]
-     (forth-test ": foo + - ;
-                  3 4 5 foo .
-                  : three+ 3 + ;
-                  5 three+ .")))
+(defn test-prim
+  [vm prim]
+  ((:fn (:word (dict-find vm prim))) vm))
 
-;;TODO -- test lit
+;;(def tmp (test-vm))
+;;(test-prim (forth-read (test-vm) "foo") "create")
+;;(-> (test-vm) (forth-read "foo") (test-prim "create") (test-prim "+"))
+
+;;(forth-exec-input (-> (new-vm) (add-prims)) ": foo + - ; : bar .s foo .s ; 3 4 5 bar")
