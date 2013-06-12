@@ -258,7 +258,9 @@
            (recur (-> vm
                       (forth-process-read)
                       (forth-step)))
-           vm)))))
+           (do
+             (println "ok")
+             vm))))))
 
 (defmacro prim-fn
   [& body]
@@ -314,7 +316,7 @@
                       vm)))
       (create-prim ".s"
                    (prim-fn
-                    (println (:stack vm))
+                    (println (reverse (:stack vm)))
                     vm))
       (create-prim "lit" (prim-fn
                           (let [info (xt->info vm (inc (:ip vm)))]
