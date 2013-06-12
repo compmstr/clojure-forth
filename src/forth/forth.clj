@@ -16,6 +16,13 @@
    :dict ()       ;;Dictionary
    })
 
+(defn update-first
+  "Updates the first item in a list using the provided function and args
+   first item gets passed to function at start of arguments"
+  [l f & args]
+  (conj (drop 1 l)
+        (apply f (first l) args)))
+
 (defn forth-read
   ([vm]
      (forth-read (read-line)))
@@ -150,13 +157,21 @@
 (defn compile-val
   [vm val]
   (update-in vm [:dict]
-             (fn [dict]
-               (conj (drop 1 dict)
-                     (add-subword (first dict) val)))))
+             update-first add-subword val))
 
 (defn compile-word
   [vm word]
   (compile-val vm (:xt (dict-find vm word))))
+
+(defn find-here
+  [vm]
+  (+ (bit-shift-left (dec (count (:dict vm))) 16)
+     (max 0 (dec (count (:subwords (first (:dict vm))))))))
+(defn compile-here
+  ([vm]
+     (compile-here vm 0))
+  ([vm offset]
+     (compile-val vm (+ (find-here vm)))))
 
 (defn handle-number
   [vm num]
@@ -188,7 +203,7 @@
 (defn run-xt
   [vm xt]
   (let [info (xt->info vm xt)]
-    (println (format "run-xt %s" (:name (:word info))))
+    ;;(println (format "run-xt %s" (:name (:word info))))
     (if (:primitive? (:word info))
       ((:fn (:word info)) vm)
       (-> vm
@@ -211,7 +226,6 @@
 (defn forth-exit
   [vm]
   (let [[new-xt vm] (pop-ret-stack vm)]
-    (println (format "forth-exit -- ret stack: %s" (:ret-stack vm)))
     (assoc vm :ip new-xt)))
 
 (defn forth-process-read
@@ -232,15 +246,12 @@
   [vm]
   (not (empty? (:input vm))))
 
-(def ^:dynamic *delay* #(Thread/sleep 100))
 (defn forth-exec-input
   ([vm]
      (forth-exec-input vm (read-line)))
   ([vm input]
      (loop [vm (forth-read vm input)]
-       (when *delay*
-        (*delay*))
-       (println (format "ip: %s -- input: %s -- mode: %s" (:ip vm) (:input vm) (:mode vm)))
+       ;;(println (format "ip: %s -- input: %s -- mode: %s" (:ip vm) (:input vm) (:mode vm)))
        (if (:ip vm)
          (recur (forth-step vm))
          (if (has-input? vm)
@@ -261,6 +272,11 @@
   (-> vm
       (create-prim "dup" (prim-fn (push-stack vm (first (vm :stack)))))
       (create-prim "over" (prim-fn (push-stack vm (second (vm :stack)))))
+      (create-prim "swap" (prim-fn
+                           (let [[a vm] (pop-stack vm)
+                                 [b vm] (pop-stack vm)
+                                 vm (push-stack vm a)]
+                             (push-stack vm b))))
       (create-prim "drop" (prim-fn (let [[_ vm] (pop-stack vm)]
                                      vm)))
       (create-prim "+" (prim-fn
@@ -300,10 +316,30 @@
                    (prim-fn
                     (println (:stack vm))
                     vm))
+      (create-prim "lit" (prim-fn
+                          (let [info (xt->info vm (inc (:ip vm)))]
+                            (println "ret stack: " (:ret-stack vm))
+                            (-> vm
+                                (push-stack (xt-info->subword-xt info))
+                                ))))
       (create-prim "create"
                    (prim-fn
                     (let [[cur-word vm] (forth-next-word vm)]
-                      (create vm cur-word))))
+                      (-> vm
+                        (create cur-word)
+                        (compile-word "lit")
+                        (compile-here 2)
+                        (compile-word "exit")))))
+      (create-prim "here"
+                   (prim-fn
+                    (push-stack vm (find-here vm))))
+      (create-prim "immediate"
+                   (prim-fn
+                    (let [first-item (first (:dict vm))
+                          new-imm (not (:immediate? first-item))]
+                      (assoc vm :dict
+                             (update-first (:dict vm) 
+                                           assoc :immediate? new-imm)))))
       (create-prim ","
                    (prim-fn
                     (let [[item vm] (pop-stack vm)]
@@ -315,19 +351,22 @@
                           (create cur-word)
                           (set-forth-mode :compile)))))
       (create-prim "exit" forth-exit)
+      (create-prim "bye" (fn [_] nil))
       (create-prim ";"
                    (prim-fn
                     (-> vm
                         (compile-word "exit")
                         (set-forth-mode :interp)))
                    true)
-      (create-prim "lit" (fn [vm]
-                           (let [info (xt->info vm (inc (:ip vm)))]
-                             (-> vm
-                                 (push-stack (xt-info->subword-xt info))
-                                 (forth-next)))))
 ))
 
+(defn repl
+  ([]
+     (repl (add-prims (new-vm))))
+  ([vm]
+     (loop [vm vm]
+       (when vm
+         (recur (forth-exec-input vm))))))
 
 (defn test-vm
   []
