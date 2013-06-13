@@ -16,6 +16,26 @@
    :dict ()       ;;Dictionary
    })
 
+(defn valid-subword?
+  [info]
+  (< (:subword info)
+     (count (:subwords (:word info)))))
+(defn valid-mem?
+  ([vm loc]
+     (valid-mem? (xt->info vm loc)))
+  ([info]
+     (when info
+       (when (valid-subword? info)
+         true))))
+(defn valid-xt?
+  ([vm xt]
+     (valid-xt? (xt->info vm xt)))
+  ([info]
+     (when info
+       (when (or (zero? (:subword info))
+                 (valid-subword? info))
+         true))))
+
 (defn update-first
   "Updates the first item in a list using the provided function and args
    first item gets passed to function at start of arguments"
@@ -91,7 +111,7 @@
 (defn create
   ([vm name]
      (create vm name nil))
-  ([vm name {:keys [primitive? immediate? fn]}]
+  ([vm name {:keys [primitive? immediate? fn codeword]}]
      (let [subwords (if primitive? nil {:subwords []})]
        (push-dict vm
                   (merge
@@ -100,7 +120,7 @@
                     :immediate? immediate?}
                    (if primitive?
                      {:fn fn}
-                     {:subwords []}))))))
+                     {:subwords [] :codeword codeword}))))))
 
 (defn create-prim
   ([vm name f]
@@ -129,23 +149,45 @@
   (let [dict-idx (xt->dict-idx vm xt)
         subword (xt->subword xt)]
     (if dict-idx
-      {:word (nth (vm :dict) dict-idx)
+      {:xt xt
+       :word (nth (vm :dict) dict-idx)
        :subword subword}
       nil)))
 
-(defn xt-info->subword-xt
+(defn xt-info->subword-val
   [info]
   (when (> (count (:subwords (:word info)))
            (:subword info))
     (nth (:subwords (:word info))
          (:subword info))))
 
+(defn mem-get
+  [vm loc]
+  (if (valid-mem? vm loc)
+    (xt-info->subword-val (xt->info vm loc))
+    (throw (Exception. "Invalid memory loc"))))
+(defn set-nth
+  [l n val]
+  (concat (take n l)
+          [val]
+          (drop (inc n) l)))
+(defn update-nth
+  [l n f & args]
+  (set-nth l n (apply f (nth l n) args)))
+(defn mem-set
+  [vm loc val]
+  (if (valid-mem? vm loc)
+    (update-in vm [:dict]
+               update-nth (xt->dict-idx vm loc)
+               (fn [entry]
+                 (update-in entry [:subwords]
+                            set-nth (xt->subword loc) val)))
+    (throw (Exception. "Invalid memory loc"))))
+               
 (defn forth-next
   ([vm num]
-     (if (and (:ip vm)
-                num)
-       (update-in vm [:ip]
-                  + num)
+     (if (and (:ip vm) num)
+       (update-in vm [:ip] + num)
        vm))
   ([vm]
      (forth-next vm 1)))
@@ -187,14 +229,6 @@
           (compile-word "lit")
           (compile-val num)))))
 
-(defn valid-xt?
-  [vm xt]
-  (let [info (xt->info vm xt)]
-    (when info
-      (when (or (zero? (:subword info))
-                (< (:subword info)
-                   (count (:subwords (:word info)))))
-        true))))
 (defn push-ret-if-valid
   [vm xt]
   (if (valid-xt? vm xt)
@@ -206,9 +240,7 @@
     ;;(println (format "run-xt %s" (:name (:word info))))
     (if (:primitive? (:word info))
       ((:fn (:word info)) vm)
-      (-> vm
-          (push-ret-if-valid (inc xt))
-          (assoc :ip (xt-info->subword-xt info))))))
+      ((:codeword (:word info)) vm info))))
 
 (defn forth-step
   [vm]
@@ -258,9 +290,17 @@
            (recur (-> vm
                       (forth-process-read)
                       (forth-step)))
-           (do
-             (println "ok")
-             vm))))))
+           vm)))))
+
+(def codewords
+  {:docol (fn [vm xt-info]
+            (-> vm
+                (push-ret-if-valid (inc (:xt xt-info)))
+                (assoc :ip (xt-info->subword-val xt-info))))
+   :docreate (fn [vm xt-info]
+               (let [vm (push-stack vm (bit-xor 0x0000 (:xt xt-info)))]
+                 (forth-exit vm)))
+})
 
 (defmacro prim-fn
   [& body]
@@ -321,17 +361,11 @@
       (create-prim "lit" (prim-fn
                           (let [info (xt->info vm (inc (:ip vm)))]
                             (println "ret stack: " (:ret-stack vm))
-                            (-> vm
-                                (push-stack (xt-info->subword-xt info))
-                                ))))
+                            (push-stack vm (xt-info->subword-val info)))))
       (create-prim "create"
                    (prim-fn
                     (let [[cur-word vm] (forth-next-word vm)]
-                      (-> vm
-                        (create cur-word)
-                        (compile-word "lit")
-                        (compile-here 2)
-                        (compile-word "exit")))))
+                      (create vm cur-word {:codeword (codewords :docreate)}))))
       (create-prim "here"
                    (prim-fn
                     (push-stack vm (find-here vm))))
@@ -346,11 +380,20 @@
                    (prim-fn
                     (let [[item vm] (pop-stack vm)]
                       (compile-val vm item))))
+      (create-prim "@"
+                   (prim-fn
+                    (let [[loc vm] (pop-stack vm)]
+                      (push-stack vm (mem-get vm loc)))))
+      (create-prim "!"
+                   (prim-fn
+                    (let [[loc vm] (pop-stack vm)
+                          [item vm] (pop-stack vm)]
+                      (mem-set vm loc item))))
       (create-prim ":"
                    (prim-fn
                     (let [[cur-word vm] (forth-next-word vm)]
                       (-> vm
-                          (create cur-word)
+                          (create cur-word {:codeword (codewords :docol)})
                           (set-forth-mode :compile)))))
       (create-prim "exit" forth-exit)
       (create-prim "bye" (fn [_] nil))
@@ -362,13 +405,30 @@
                    true)
 ))
 
+(defn add-stdlib
+  [vm]
+  (-> vm
+      (forth-exec-input ": 2dup over over ;")))
+
+(defn init-vm
+  ([]
+     (init-vm (new-vm)))
+  ([vm]
+     (-> vm
+         (add-prims)
+         (add-stdlib))))
+
 (defn repl
   ([]
-     (repl (add-prims (new-vm))))
+     (repl (init-vm)))
   ([vm]
      (loop [vm vm]
        (when vm
+         (println "ok")
          (recur (forth-exec-input vm))))))
+(defn forth-eval
+  [input]
+  (forth-exec-input (init-vm) input))
 
 (defn test-vm
   []
