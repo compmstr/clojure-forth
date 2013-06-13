@@ -16,6 +16,30 @@
    :dict ()       ;;Dictionary
    })
 
+;;xts are as follows:
+;;  lower 16 bits -> subword
+;;  upper 47/48 bits -> index from bottom of dictionary stack
+(defn xt->dict-idx
+  [vm xt]
+  (let [dict-size (count (vm :dict))
+        from-bottom (bit-shift-right xt 16)]
+    (if (< from-bottom dict-size)
+      (- (dec dict-size) from-bottom)
+      nil)))
+(defn xt->subword
+  [xt]
+  (bit-and xt 0xFFFF))
+
+(defn xt->info
+  [vm xt]
+  (let [dict-idx (xt->dict-idx vm xt)
+        subword (xt->subword xt)]
+    (if dict-idx
+      {:xt xt
+       :word (nth (vm :dict) dict-idx)
+       :subword subword}
+      nil)))
+
 (defn valid-subword?
   [info]
   (< (:subword info)
@@ -130,30 +154,6 @@
                       :immediate? immediate?
                       :fn f})))
 
-;;xts are as follows:
-;;  lower 16 bits -> subword
-;;  upper 47/48 bits -> index from bottom of dictionary stack
-(defn xt->dict-idx
-  [vm xt]
-  (let [dict-size (count (vm :dict))
-        from-bottom (bit-shift-right xt 16)]
-    (if (< from-bottom dict-size)
-      (- (dec dict-size) from-bottom)
-      nil)))
-(defn xt->subword
-  [xt]
-  (bit-and xt 0xFFFF))
-
-(defn xt->info
-  [vm xt]
-  (let [dict-idx (xt->dict-idx vm xt)
-        subword (xt->subword xt)]
-    (if dict-idx
-      {:xt xt
-       :word (nth (vm :dict) dict-idx)
-       :subword subword}
-      nil)))
-
 (defn xt-info->subword-val
   [info]
   (when (> (count (:subwords (:word info)))
@@ -260,6 +260,19 @@
   (let [[new-xt vm] (pop-ret-stack vm)]
     (assoc vm :ip new-xt)))
 
+(defn forth-skip
+  ([vm]
+     (forth-skip vm 1))
+  ([vm amt]
+     (update-in vm [:ret-stack] update-first + amt)))
+
+(defn forth-next-val
+  "Gets the next subword to be executed in the caller
+   useful for stuff like lit/branch/et al that compile a value after
+   the actual word"
+  [vm]
+  (xt-info->subword-val (xt->info vm (first (:ret-stack vm)))))
+
 (defn forth-process-read
   [vm]
   (let [[word vm] (forth-next-word vm)
@@ -359,9 +372,29 @@
                     (println (reverse (:stack vm)))
                     vm))
       (create-prim "lit" (prim-fn
-                          (let [info (xt->info vm (inc (:ip vm)))]
-                            (println "ret stack: " (:ret-stack vm))
-                            (push-stack vm (xt-info->subword-val info)))))
+                            (-> vm
+                                (push-stack (forth-next-val vm))
+                                (forth-skip))))
+      (create-prim "branch" (prim-fn
+                             (println (format "branch -- next val: %s" (forth-next-val vm)))
+                             (forth-skip vm (forth-next-val vm))))
+      (create-prim "?branch" (prim-fn
+                              (let [[flag vm] (pop-stack vm)]
+                                (if (zero? flag)
+                                  (forth-skip vm)
+                                  (forth-skip vm (forth-next-val vm))))))
+      (create-prim "jmp" (prim-fn ;;Test word for branch
+                          (let [[amt vm] (forth-next-word vm)]
+                            (-> vm
+                                (compile-word "branch")
+                                (compile-val (Integer/valueOf amt)))))
+                   true)
+      (create-prim "?jmp" (prim-fn ;;Test word for ?branch
+                           (let [[amt vm] (forth-next-word vm)]
+                             (-> vm
+                                 (compile-word "?branch")
+                                 (compile-val (Integer/valueOf amt)))))
+                   true)
       (create-prim "create"
                    (prim-fn
                     (let [[cur-word vm] (forth-next-word vm)]
