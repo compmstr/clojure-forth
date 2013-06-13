@@ -132,6 +132,17 @@
            (rest dict)
            (dec from-bottom)))))))
 
+;;Dictionary entries have the following:
+;;  all:
+;;    name
+;;    primitive?
+;;    immediate?
+;;  primitives:
+;;    fn
+;;  non-primitives:
+;;    subwords
+;;    codeword
+;;    [does-xt]
 (defn create
   ([vm name]
      (create vm name nil))
@@ -200,6 +211,14 @@
   [vm val]
   (update-in vm [:dict]
              update-first add-subword val))
+(defn- allot-subwords
+  [entry num]
+  (update-in entry [:subwords]
+             concat (take num (repeat 0))))
+(defn allot
+  [vm num]
+  (update-in vm [:dict]
+             update-first allot-subwords num))
 
 (defn compile-word
   [vm word]
@@ -313,6 +332,9 @@
    :docreate (fn [vm xt-info]
                (let [vm (push-stack vm (bit-xor 0x0000 (:xt xt-info)))]
                  (forth-exit vm)))
+   :dodoes (fn [vm xt-info]
+             (let [vm (push-stack vm (bit-xor 0x0000 (:xt xt-info)))]
+               (assoc vm :ip (:does-xt (:word xt-info)))))
 })
 
 (defmacro prim-fn
@@ -413,6 +435,10 @@
                    (prim-fn
                     (let [[item vm] (pop-stack vm)]
                       (compile-val vm item))))
+      (create-prim "allot"
+                   (prim-fn
+                    (let [[num vm] (pop-stack vm)]
+                      (allot vm num))))
       (create-prim "@"
                    (prim-fn
                     (let [[loc vm] (pop-stack vm)]
@@ -428,6 +454,20 @@
                       (-> vm
                           (create cur-word {:codeword (codewords :docol)})
                           (set-forth-mode :compile)))))
+      (create-prim ">mark" ;;push here to the stack
+                   (prim-fn
+                    (let [here (find-here vm)]
+                      (push-stack vm here)))
+                   true);;immediate
+      (create-prim "if"
+                   (prim-fn
+                    (let [here (find-here vm)]
+                      (-> vm
+                          (compile-word "?branch")
+                          (push-stack here) ;;mark the spot for if
+                          (compile-val 0) ;;save space for the branch distance
+                          )))
+                   true);;immediate
       (create-prim "exit" forth-exit)
       (create-prim "bye" (fn [_] nil))
       (create-prim ";"
