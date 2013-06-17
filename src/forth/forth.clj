@@ -379,10 +379,10 @@
                                   (forth-skip vm)
                                   (forth-skip vm (forth-next-val vm))))))
       (create-prim "(0branch)" (prim-fn
-                              (let [[flag vm] (pop-stack vm)]
-                                (if (zero? flag)
-                                  (forth-skip vm (forth-next-val vm))
-                                  (forth-skip vm)))))
+                                (let [[flag vm] (pop-stack vm)]
+                                  (if (zero? flag)
+                                    (forth-skip vm (forth-next-val vm))
+                                    (forth-skip vm)))))
       (create-prim "jmp" (prim-fn ;;Test word for branch
                           (let [[amt vm] (forth-next-word vm)]
                             (-> vm
@@ -480,7 +480,10 @@
       ;;begin-until -> [start-xt] <stuff> ?branch <start-xt>
       ;;begin-while-repeat -> [start-xt] 0branch <end-xt> <stuff> branch <start-xt> [end-xt]
       ;;begin-again -> [start-xt] <stuff> branch <start-xt>  --- multiple aborts how?
-      (create-prim "begin"
+;;      TODO: find out why begin at start of word breaks
+;;      (forth-eval ": foo begin 1 - dup . dup 0= until drop ; 5 foo") -> 4 0
+;;      (forth-eval ": foo 5 begin 1 - dup . dup 0= until drop ; foo") -> 4 3 2 1 0
+;;      (create-prim "begin"
                    (prim-fn
                     (push-stack vm (find-here vm)))
                    true);;immediate
@@ -489,8 +492,7 @@
                     (let [[mark vm] (pop-stack vm)
                           vm (compile-word vm "(0branch)")
                           here (find-here vm)]
-                      (println (format "until... %s" (dec (- mark here))))
-                      (compile-val vm (dec (- mark here)))))
+                      (compile-val vm (- mark here))))
                    true);;immediate
       (create-prim "exit" forth-exit)
       (create-prim "bye" (fn [_] nil))
