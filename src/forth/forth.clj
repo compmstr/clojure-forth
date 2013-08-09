@@ -483,7 +483,7 @@
 ;;      TODO: find out why begin at start of word breaks
 ;;      (forth-eval ": foo begin 1 - dup . dup 0= until drop ; 5 foo") -> 4 0
 ;;      (forth-eval ": foo 5 begin 1 - dup . dup 0= until drop ; foo") -> 4 3 2 1 0
-;;      (create-prim "begin"
+      (create-prim "begin"
                    (prim-fn
                     (push-stack vm (find-here vm)))
                    true);;immediate
