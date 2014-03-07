@@ -1,5 +1,6 @@
 (ns forth.forth
-  (use clojure.repl))
+  (use clojure.repl
+       forth.util))
 
 ;;Dictonary entries have the following keys:
 ;;  :fn or :subwords if primitive or not
@@ -60,13 +61,6 @@
                  (valid-subword? info))
          true))))
 
-(defn update-first
-  "Updates the first item in a list using the provided function and args
-   first item gets passed to function at start of arguments"
-  [l f & args]
-  (conj (drop 1 l)
-        (apply f (first l) args)))
-
 (defn forth-read
   ([vm]
      (forth-read (read-line)))
@@ -91,6 +85,11 @@
   (forth-read-until vm))
 
 
+(defn cons->list
+  [l]
+  (if (= (class l) clojure.lang.Cons)
+    (apply list l)
+    l))
 (defn do-pop
   "Return a vector of [<popped value> <new vm state>]"
   ([stack vm]
@@ -99,9 +98,9 @@
      (let [item (first (vm stack))]
        [item
         (if (not check-empty?)
-          (update-in vm [stack] pop)
+          (update-in vm [stack] (comp pop cons->list))
           (if (not (empty? (vm stack)))
-            (update-in vm [stack] pop)
+            (update-in vm [stack] (comp pop cons->list))
             vm))])))
 
 (defn do-push
@@ -117,7 +116,7 @@
 (defn set-forth-mode [vm mode] (assoc vm :mode mode))
 (defn set-forth-ip [vm ip] (assoc vm :ip ip))
 
-(defn dict-find
+(defn dict-find-old
   [vm word]
   (let [dict (vm :dict)]
     (loop [cur (first dict)
@@ -131,6 +130,14 @@
            (first dict)
            (rest dict)
            (dec from-bottom)))))))
+(defn dict-find
+  [vm word]
+  (when-let [[from-bottom found-word] 
+             (->> (zipmap (range) (vm :dict))
+                  (filter (fn [[_ cur-word :as entry]]
+                            (= (:name cur-word) word)))
+                  (first))]
+    {:word found-word :xt (bit-shift-left from-bottom 16)}))
 
 ;;Dictionary entries have the following:
 ;;  all:
@@ -177,22 +184,15 @@
   (if (valid-mem? vm loc)
     (xt-info->subword-val (xt->info vm loc))
     (throw (Exception. "Invalid memory loc"))))
-(defn set-nth
-  [l n val]
-  (concat (take n l)
-          [val]
-          (drop (inc n) l)))
-(defn update-nth
-  [l n f & args]
-  (set-nth l n (apply f (nth l n) args)))
 (defn mem-set
   [vm loc val]
   (if (valid-mem? vm loc)
     (update-in vm [:dict]
                update-nth (xt->dict-idx vm loc)
                (fn [entry]
-                 (update-in entry [:subwords]
-                            set-nth (xt->subword loc) val)))
+                 (assoc entry :subwords
+                        (apply vector
+                               (set-nth (:subwords entry) (xt->subword loc) val)))))
     (throw (Exception. "Invalid memory loc"))))
                
 (defn forth-next
@@ -306,24 +306,6 @@
           (compile-val vm (:xt entry))))
       (handle-number vm word))))
 
-(defn- has-input?
-  [vm]
-  (not (empty? (:input vm))))
-
-(defn forth-exec-input
-  ([vm]
-     (forth-exec-input vm (read-line)))
-  ([vm input]
-     (loop [vm (forth-read vm input)]
-       ;;(println (format "ip: %s -- input: %s -- mode: %s" (:ip vm) (:input vm) (:mode vm)))
-       (if (:ip vm)
-         (recur (forth-step vm))
-         (if (has-input? vm)
-           (recur (-> vm
-                      (forth-process-read)
-                      (forth-step)))
-           vm)))))
-
 (def codewords
   {:docol (fn [vm xt-info]
             (-> vm
@@ -397,24 +379,28 @@
                             (-> vm
                                 (push-stack (forth-next-val vm))
                                 (forth-skip))))
-      (create-prim "branch" (prim-fn
-                             (println (format "branch -- next val: %s" (forth-next-val vm)))
+      (create-prim "(branch)" (prim-fn
                              (forth-skip vm (forth-next-val vm))))
-      (create-prim "?branch" (prim-fn
+      (create-prim "(?branch)" (prim-fn
                               (let [[flag vm] (pop-stack vm)]
                                 (if (zero? flag)
                                   (forth-skip vm)
                                   (forth-skip vm (forth-next-val vm))))))
+      (create-prim "(0branch)" (prim-fn
+                                (let [[flag vm] (pop-stack vm)]
+                                  (if (zero? flag)
+                                    (forth-skip vm (forth-next-val vm))
+                                    (forth-skip vm)))))
       (create-prim "jmp" (prim-fn ;;Test word for branch
                           (let [[amt vm] (forth-next-word vm)]
                             (-> vm
-                                (compile-word "branch")
+                                (compile-word "(branch)")
                                 (compile-val (Integer/valueOf amt)))))
                    true)
       (create-prim "?jmp" (prim-fn ;;Test word for ?branch
                            (let [[amt vm] (forth-next-word vm)]
                              (-> vm
-                                 (compile-word "?branch")
+                                 (compile-word "(?branch)")
                                  (compile-val (Integer/valueOf amt)))))
                    true)
       (create-prim "create"
@@ -459,14 +445,62 @@
                     (let [here (find-here vm)]
                       (push-stack vm here)))
                    true);;immediate
+      (create-prim "="
+                   (prim-fn
+                    (let [[a vm] (pop-stack vm)
+                          [b vm] (pop-stack vm)]
+                      (if (= a b)
+                        (push-stack vm 1)
+                        (push-stack vm 0)))))
+      ;;if: compile ?branch 0 , push xt of the 0 to stack
+      ;;then: update xt at top of stack with here
+      ;;else: update xt at top of stack with here 
+            ;;compile branch 0, push loc of 0 to top of stack
+      ;;if -> 0branch <else-xt> <then> [else-xt]
+      ;;if else -> 0branch <else-xt> <then> branch <end-xt> [else-xt] <else> [end-xt]
       (create-prim "if"
                    (prim-fn
-                    (let [here (find-here vm)]
+                    (let [vm (-> vm
+                                 (compile-word "(0branch)")
+                                 (compile-val 0))
+                          here (find-here vm)]
+                      (push-stack vm here))) ;;mark the spot for if
+                   true);;immediate
+      (create-prim "then"
+                   (prim-fn
+                    (let [here (find-here vm)
+                          [mark vm] (pop-stack vm)]
+                      (mem-set vm mark (inc (- here mark)))))
+                   true);;immediate
+      (create-prim "else"
+                   (prim-fn
+                    (let [vm (-> vm
+                                 (compile-word "(branch)")
+                                 (compile-val 0))
+                          end-jmp-loc (find-here vm)
+                          else-loc (find-here vm)
+                          [mark vm] (pop-stack vm)]
                       (-> vm
-                          (compile-word "?branch")
-                          (push-stack here) ;;mark the spot for if
-                          (compile-val 0) ;;save space for the branch distance
-                          )))
+                          (mem-set mark (inc (- else-loc mark)))
+                          (push-stack end-jmp-loc))
+                      ))
+                   true);;immediate
+      ;;begin-until -> [start-xt] <stuff> ?branch <start-xt>
+      ;;begin-while-repeat -> [start-xt] 0branch <end-xt> <stuff> branch <start-xt> [end-xt]
+      ;;begin-again -> [start-xt] <stuff> branch <start-xt>  --- multiple aborts how?
+;;      TODO: find out why begin at start of word breaks
+;;      (forth-eval ": foo begin 1 - dup . dup 0= until drop ; 5 foo") -> 4 0
+;;      (forth-eval ": foo 5 begin 1 - dup . dup 0= until drop ; foo") -> 4 3 2 1 0
+      (create-prim "begin"
+                   (prim-fn
+                    (push-stack vm (find-here vm)))
+                   true);;immediate
+      (create-prim "until"
+                   (prim-fn
+                    (let [[mark vm] (pop-stack vm)
+                          vm (compile-word vm "(0branch)")
+                          here (find-here vm)]
+                      (compile-val vm (- mark here))))
                    true);;immediate
       (create-prim "exit" forth-exit)
       (create-prim "bye" (fn [_] nil))
@@ -478,10 +512,12 @@
                    true)
 ))
 
+(declare forth-exec-input)
 (defn add-stdlib
   [vm]
   (-> vm
-      (forth-exec-input ": 2dup over over ;")))
+      (forth-exec-input ": 2dup over over ;")
+      (forth-exec-input ": 0= 0 = ;")))
 
 (defn init-vm
   ([]
@@ -491,6 +527,31 @@
          (add-prims)
          (add-stdlib))))
 
+(defn- has-input?
+  [vm]
+  (not (empty? (:input vm))))
+
+(defn forth-exec-input
+  ([vm]
+     (forth-exec-input vm (read-line)))
+  ([vm input]
+     (loop [vm (forth-read vm input)]
+       ;;(println (format "ip: %s -- input: %s -- mode: %s" (:ip vm) (:input vm) (:mode vm)))
+       (if (:ip vm)
+         (recur (forth-step vm))
+         (if (has-input? vm)
+           (recur (-> vm
+                      (forth-process-read)
+                      (forth-step)))
+           vm)))))
+
+(defn forth-eval
+  ([input]
+     (forth-exec-input (init-vm) input))
+  ([vm input]
+     (forth-exec-input vm input)))
+
+
 (defn repl
   ([]
      (repl (init-vm)))
@@ -499,10 +560,6 @@
        (when vm
          (println "ok")
          (recur (forth-exec-input vm))))))
-(defn forth-eval
-  [input]
-  (forth-exec-input (init-vm) input))
-
 (defn test-vm
   []
   (-> (new-vm)
@@ -514,8 +571,31 @@
   [vm prim]
   ((:fn (:word (dict-find vm prim))) vm))
 
+(defn see-subwords-idx
+  [vm dict-idx]
+  {:word (:name (nth (:dict vm) dict-idx))
+   :subwords (map #(if (map? %)
+                     (vector 
+                      (:xt %)
+                      ((comp :name :word) %))
+                     [%])
+                  (map #(if (>= % 0)
+                          (xt->info vm %)
+                          %)
+                       (:subwords (nth (:dict vm) dict-idx))))})
+  (defn see-subwords
+    "Get the named subwords for the provided word, either as an xt or a name"
+    [vm key]
+    (if (string? key)
+      (recur vm (:xt (dict-find vm key)))
+      (see-subwords-idx vm (xt->dict-idx vm key))))
+
+
 ;;(def tmp (test-vm))
 ;;(test-prim (forth-read (test-vm) "foo") "create")
 ;;(-> (test-vm) (forth-read "foo") (test-prim "create") (test-prim "+"))
 
 ;;(forth-exec-input (-> (new-vm) (add-prims)) ": foo + - ; : bar .s foo .s ; 3 4 5 bar")
+
+;;TODO -- get this working properly... appears to loop, but does it oddly
+;;(def tmp (atom (forth-eval ": foo 5 begin 3 swap 1 - dup 0= until ;")))
